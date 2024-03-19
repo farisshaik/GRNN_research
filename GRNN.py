@@ -1,17 +1,30 @@
 import time, datetime
+
+import torch
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from utils import *
 from Generator.model import Generator
 from TFLogger.logger import TFLogger
 from Backbone import *
-torch.set_default_tensor_type('torch.cuda.FloatTensor')
+# torch.set_default_tensor_type('torch.cuda.FloatTensor')
+
+from torch.utils.tensorboard import SummaryWriter
+
+# Check if MPS (Apple's Metal API) is available and set it as the default device
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("running mps")
+else:
+    device = torch.device("cpu")  # Fallback to CPU if MPS is not available
+    print("running cpu")
+
 
 def main():
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
     device0 = 0 # for GRNN training
-    device1 = 1 # for local training, if you have only one GPU, please set device1 to 0
+    device1 = 0 # for local training, if you have only one GPU, please set device1 to 0
     batchsize = 1
     save_img = True # whether same generated image and its relevant true image
     Iteration = 1000 # how many optimization steps on GRNN
@@ -31,29 +44,43 @@ def main():
     dst, num_classes= gen_dataset(dataset, data_path, shape_img) # read local data
     tp = transforms.Compose([transforms.ToPILImage()])
     train_loader = iter(torch.utils.data.DataLoader(dst, batch_size=batchsize, shuffle=True))
-    criterion = nn.CrossEntropyLoss().cuda(device1)
+    # criterion = nn.CrossEntropyLoss().cuda(device1)
+    criterion = nn.CrossEntropyLoss().to(device)
     print(f'{str(time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime()))}: {save_path}')
     for idx_net in range(num_exp):
-        train_tfLogger = TFLogger(f'{save_path}/tfrecoard-exp-{str(idx_net).zfill(2)}') # tensorboard record
+        train_logger = SummaryWriter(f'{save_path}/tfrecoard-exp-{str(idx_net).zfill(2)}')
         print(f'{str(time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime()))}: running {idx_net+1}|{num_exp} experiment')
         if net_name == 'lenet':
             net = LeNet(num_classes=num_classes)
         elif net_name == 'res18':
             net = ResNet18(num_classes=num_classes)
-        net = net.cuda(device1)
-        Gnet = Generator(num_classes, channel=3, shape_img=shape_img[0],
-                         batchsize=batchsize, g_in=g_in).cuda(device0)
+        # net = net.cuda(device1)
+        # Gnet = Generator(num_classes, channel=3, shape_img=shape_img[0],
+        #                  batchsize=batchsize, g_in=g_in).cuda(device0)
+        net = net.to(device)
+        Gnet = Generator(num_classes, channel=3, shape_img=shape_img[0], batchsize=batchsize, g_in=g_in).to(device)
         net.apply(weights_init)
         Gnet.weight_init(mean=0.0, std=0.02)
         G_optimizer = torch.optim.RMSprop(Gnet.parameters(), lr=0.0001, momentum=0.99)
         tv_loss = TVLoss()
         gt_data,gt_label = next(train_loader)
-        gt_data, gt_label = gt_data.cuda(device1), gt_label.cuda(device1) # assign to device1 to generate true graident
+        # gt_data, gt_label = gt_data.cuda(device1), gt_label.cuda(device1) # assign to device1 to generate true graident
+        gt_data, gt_label = gt_data.to(device), gt_label.to(device)  # Move to MPS or CPU, based on device availability
         pred = net(gt_data)
+
+        # Assuming `net` is an instance of the model
+        output = net(gt_data)
+
+        # If output is a tuple, unpack it and only use the actual output for the loss calculation
+        pred, indices1, indices2 = output if isinstance(output, tuple) else (output, None, None)
+
+        # Now calculate the loss with the predictions only
         y = criterion(pred, gt_label)
+
         dy_dx = torch.autograd.grad(y, net.parameters()) # obtain true gradient
         flatten_true_g = flatten_gradients(dy_dx)
-        G_ran_in = torch.randn(batchsize, g_in).cuda(device0) # initialize GRNN input
+        # G_ran_in = torch.randn(batchsize, g_in).cuda(device0) # initialize GRNN input
+        G_ran_in = torch.randn(batchsize, g_in).to(device)  # Initialize GRNN input and move to MPS or CPU
         iter_bar = tqdm(range(Iteration),
                         total=Iteration,
                         desc=f'{str(time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime()))}',
@@ -62,11 +89,14 @@ def main():
         history_l = []
         for iters in iter_bar: # start  optimizing GRNN
             Gout, Glabel = Gnet(G_ran_in) # produce recovered data
-            Gout, Glabel = Gout.cuda(device1), Glabel.cuda(device1) # assign to device1 as global model's input to generate fake gradient
+            # Gout, Glabel = Gout.cuda(device1), Glabel.cuda(device1) # assign to device1 as global model's input to generate fake gradient
+            Gout, Glabel = Gout.to(device), Glabel.to(
+                device)  # Move to MPS or CPU as global model's input to generate fake gradient
             Gpred = net(Gout)
-            Gloss = - torch.mean(torch.sum(Glabel * torch.log(torch.softmax(Gpred, 1)), dim=-1)) # cross-entropy loss
+            Gloss = - torch.mean(torch.sum(Glabel * torch.log(torch.softmax(Gpred[0], 1)), dim=-1)) # cross-entropy loss
             G_dy_dx = torch.autograd.grad(Gloss, net.parameters(), create_graph=True) # obtain fake gradient
-            flatten_fake_g = flatten_gradients(G_dy_dx).cuda(device1)
+            # flatten_fake_g = flatten_gradients(G_dy_dx).cuda(device1)
+            flatten_fake_g = flatten_gradients(G_dy_dx).to(device)  # Move to MPS or CPU
             grad_diff_l2 = loss_f('l2', flatten_fake_g, flatten_true_g, device1)
             grad_diff_wd = loss_f('wd', flatten_fake_g, flatten_true_g, device1)
             if net_name == 'lenet':
@@ -83,17 +113,17 @@ def main():
                                  img_mses=round(torch.mean(abs(Gout-gt_data)).item(), 8),
                                  img_wd=round(wasserstein_distance(Gout.view(1,-1), gt_data.view(1,-1)).item(), 8))
 
-            train_tfLogger.scalar_summary('g_l2', grad_diff_l2.item(), iters)
-            train_tfLogger.scalar_summary('g_wd', grad_diff_wd.item(), iters)
-            train_tfLogger.scalar_summary('g_tv', tvloss.item(), iters)
-            train_tfLogger.scalar_summary('img_mses', torch.mean(abs(Gout-gt_data)).item(), iters)
-            train_tfLogger.scalar_summary('img_wd', wasserstein_distance(Gout.view(1,-1), gt_data.view(1,-1)).item(), iters)
-            train_tfLogger.scalar_summary('toal_loss', grad_diff.item(), iters)
+            train_logger.add_scalar('g_l2', grad_diff_l2.item(), iters)
+            train_logger.add_scalar('g_wd', grad_diff_wd.item(), iters)
+            train_logger.add_scalar('g_tv', tvloss.item(), iters)
+            train_logger.add_scalar('img_mses', torch.mean(abs(Gout - gt_data)).item(), iters)
+            train_logger.add_scalar('img_wd', wasserstein_distance(Gout.view(1, -1), gt_data.view(1, -1)).item(), iters)
+            train_logger.add_scalar('total_loss', grad_diff.item(), iters)
 
             if iters % int(Iteration / plot_num) == 0:
                 history.append([tp(Gout[imidx].detach().cpu()) for imidx in range(batchsize)])
                 history_l.append([Glabel.argmax(dim=1)[imidx].item() for imidx in range(batchsize)])
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
             del Gloss, G_dy_dx, flatten_fake_g, grad_diff_l2, grad_diff_wd, grad_diff, tvloss
 
         # visualization
@@ -121,11 +151,11 @@ def main():
             plt.close()
 
         del Glabel, Gout, flatten_true_g, G_ran_in, net, Gnet
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         history.clear()
         history_l.clear()
         iter_bar.close()
-        train_tfLogger.close()
+        train_logger.close()
         print('----------------------')
 
 if __name__ == '__main__':

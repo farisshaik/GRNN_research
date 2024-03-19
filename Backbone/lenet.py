@@ -14,11 +14,11 @@ class LeNet(nn.Module):
 
     def forward(self, x):
         x = func.sigmoid(self.conv1(x))
-        x = func.max_pool2d(x, 2)
+        x, indices1 = func.max_pool2d(x, 2, return_indices=True)
         x = func.sigmoid(self.conv2(x))
-        x = func.max_pool2d(x, 2)
+        x, indices2 = func.max_pool2d(x, 2, return_indices=True)
         x = x.view(x.size(0), -1)
         x = func.sigmoid(self.fc1(x))
         x = func.sigmoid(self.fc2(x))
         x = self.fc3(x)
-        return x
+        return x, indices1, indices2
